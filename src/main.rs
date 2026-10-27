@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod i18n;
 mod shortcut;
 
 use std::cell::RefCell;
@@ -9,21 +10,23 @@ use std::rc::Rc;
 
 use native_windows_gui as nwg;
 use windows::Win32::Foundation::{
-    HWND, LPARAM, POINT, RECT, WPARAM
+    HWND, LPARAM, POINT, RECT, SIZE, WPARAM
 };
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST
+    GetDC, GetMonitorInfoW, GetTextExtentPoint32W, MonitorFromPoint, ReleaseDC, SelectObject,
+    HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DeleteMenu, DrawMenuBar, GetCursorPos, GetSystemMenu, GetWindowLongPtrW, SendMessageW,
-    SetClassLongPtrW, SetWindowLongPtrW, SetWindowPos, GCLP_HICON, GCLP_HICONSM,
-    GWL_EXSTYLE, ICON_BIG, ICON_SMALL, MF_BYCOMMAND, SC_MAXIMIZE, SC_MINIMIZE,
+    DeleteMenu, DrawMenuBar, GetCursorPos, GetSystemMenu, GetWindowLongPtrW, GetWindowRect,
+    SendMessageW, SetClassLongPtrW, SetWindowLongPtrW, SetWindowPos, GCLP_HICON, GCLP_HICONSM,
+    GWL_EXSTYLE, GWL_STYLE, ICON_BIG, ICON_SMALL, MF_BYCOMMAND, SC_MAXIMIZE, SC_MINIMIZE,
     SC_RESTORE, SC_SIZE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, WM_SETICON, WS_EX_DLGMODALFRAME
+    SWP_NOZORDER, WM_SETICON, WS_CLIPSIBLINGS, WS_EX_DLGMODALFRAME
 };
 
-const APP_TITLE: &str = "Edge Shortcut Tool";
+use i18n::{Language, Strings};
+
 const CUSTOM_WINDOW_CENTER_Y_OFFSET: i32 = -3;
 
 const OLD_FEATURE: &str = "msFeatureGroupNewLookAndFeelHoldout";
@@ -39,47 +42,31 @@ const BLACK: [u8; 3] = [0, 0, 0];
 const NOTE_RED: [u8; 3] = [225, 0, 0];
 const LINK_BLUE: [u8; 3] = [0, 0, 225];
 const EM_SETRECT_MESSAGE: u32 = 0x00B3;
-const HELP_TEXT: &str = concat!(
-    "Old workaround\r\n",
-    "Uses msFeatureGroupNewLookAndFeelHoldout.\r\n",
-    "This is the older/broader method for removing rounded corner look.\r\n",
-    "\r\n",
-    "New workaround\r\n",
-    "Uses msForceNoRoundedCornerAndMargin.\r\n",
-    "This is the newer/more direct method for removing rounded corners and margins.\r\n",
-    "\r\n",
-    "Restore default\r\n",
-    "Clears all command-line flags managed by this tool and restores normal launch behavior.\r\n",
-    "\r\n",
-    "Hide sign-in red dot\r\n",
-    "When checked, this also disables msShowSignInIndicator.\r\n",
-    "This hides the red sign-in reminder dot on profile icon.\r\n",
-    "\r\n",
-    "Restore sidebar\r\n",
-    "When checked, this also disables msHubAppsSidebarRetirement.\r\n",
-    "This attempts to restore the classic sidebar app list.\r\n",
-    "\r\n",
-    "Disable extensions\r\n",
-    "When checked, this also adds --disable-extensions.\r\n",
-    "This starts Edge without loading browser extensions.\r\n",
-    "\r\n",
-    "Advanced\r\n",
-    "Choose which shortcut names are updated.\r\n",
-    "You can also apply flags when Edge is opened by another app such as Discord or Teams.\r\n",
-    "\r\n",
-    "Custom\r\n",
-    "Standalone example: --disable-extensions --force-dark-mode --mute-audio\r\n",
-    "Enable example: msForceNoRoundedCornerAndMargin,msUndersideButton,ParallelDownloading\r\n",
-    "Disable example: msShowSignInIndicator,msHubAppsSidebarRetirement,MediaRouter\r\n",
-    "\r\n",
-    "Info\r\n",
-    "Displays executable candidates and selected shortcut locations.\r\n",
-    "For reference and diagnostic purposes only.\r\n",
-    "\r\n",
-    "Reminder\r\n",
-    "Disable Startup Boost in Edge first. Copy and paste this into Edge address bar: ",
-    "edge://settings/system/manageSystem"
-);
+
+/// Language independent identity of the action reported in the status field, so
+/// the message can be rebuilt in the newly selected language.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PresetName {
+    OldWorkaround,
+    NewWorkaround,
+    RestoreDefault,
+    Custom
+}
+
+#[derive(Clone, Copy)]
+enum StatusState {
+    Ready,
+    Applying,
+    CompletedWithErrors,
+    Applied(PresetName),
+    EnterCustomFlags
+}
+
+impl Default for StatusState {
+    fn default() -> Self {
+        StatusState::Ready
+    }
+}
 
 #[derive(Default)]
 struct App {
@@ -88,6 +75,10 @@ struct App {
     button_shortcuts: nwg::Button,
     button_custom: nwg::Button,
     button_help: nwg::Button,
+    button_language: nwg::Button,
+    language_menu: nwg::Menu,
+    language_items: RefCell<Vec<nwg::MenuItem>>,
+    language: RefCell<Language>,
 
     preset_panel: nwg::Frame,
     preset_line_top_left: nwg::RichLabel,
@@ -159,22 +150,28 @@ struct App {
     tooltip: nwg::Tooltip,
     shortcut_selection: RefCell<shortcut::ShortcutTargetSelection>,
     apply_external_links: RefCell<bool>,
-    last_apply_result: RefCell<Option<shortcut::ApplyResult>>
+    last_apply_result: RefCell<Option<shortcut::ApplyResult>>,
+    status_state: RefCell<StatusState>
 }
 
 impl App {
     fn build() -> Result<Self, nwg::NwgError> {
         let mut app = App::default();
 
+        // The stored settings also pick the interface language, so they have to
+        // be read before the first control is created.
+        let settings = shortcut::load_app_settings();
+        *app.language.borrow_mut() = settings.language;
+
         app.build_fonts()?;
         app.build_main_window()?;
         app.build_shortcuts_window()?;
         app.build_custom_window()?;
         app.build_help_window()?;
-        app.load_settings();
+        app.apply_settings(&settings);
         app.build_status_window()?;
         app.build_tooltips()?;
-        app.style_help_text();
+        app.retranslate();
         app.harden_window_chrome();
         app.center_main_window();
 
@@ -182,6 +179,11 @@ impl App {
         app.button_help.set_focus();
 
         Ok(app)
+    }
+
+    /// Translation table of the language currently shown by the interface.
+    fn strings(&self) -> &'static Strings {
+        i18n::strings(*self.language.borrow())
     }
 
     fn build_fonts(&mut self) -> Result<(), nwg::NwgError> {
@@ -210,6 +212,9 @@ impl App {
     }
 
     fn build_main_window(&mut self) -> Result<(), nwg::NwgError> {
+        let active_language = *self.language.borrow();
+        let t = self.strings();
+
         const WINDOW_W: i32 = 312;
 
         const MARGIN: i32 = 14;
@@ -218,7 +223,8 @@ impl App {
         const TOP_BUTTON_H: i32 = 25;
         const TOP_BUTTON_GAP: i32 = 5;
         const RIGHT_EDGE: i32 = WINDOW_W - MARGIN;
-        const HELP_X: i32 = RIGHT_EDGE - TOP_BUTTON_W;
+        const LANGUAGE_X: i32 = RIGHT_EDGE - TOP_BUTTON_W;
+        const HELP_X: i32 = LANGUAGE_X - TOP_BUTTON_GAP - TOP_BUTTON_W;
         const CUSTOM_X: i32 = HELP_X - TOP_BUTTON_GAP - TOP_BUTTON_W;
         const SHORTCUTS_X: i32 = CUSTOM_X - TOP_BUTTON_GAP - TOP_BUTTON_W;
 
@@ -270,7 +276,7 @@ impl App {
             .flags(nwg::WindowFlags::WINDOW)
             .size((WINDOW_W, WINDOW_H))
             .position((400, 300))
-            .title(APP_TITLE)
+            .title(t.app_title)
             .build(&mut self.window)?;
 
         nwg::Button::builder()
@@ -297,6 +303,37 @@ impl App {
             .parent(&self.window)
             .build(&mut self.button_help)?;
 
+        // Language switcher: the label shows the active language, the menu below
+        // lists every available translation.
+        nwg::Button::builder()
+            .text(active_language.short_label())
+            .position((LANGUAGE_X, TOP_BUTTON_Y))
+            .size((TOP_BUTTON_W, TOP_BUTTON_H))
+            .font(Some(&self.ui_font))
+            .parent(&self.window)
+            .build(&mut self.button_language)?;
+
+        nwg::Menu::builder()
+            .popup(true)
+            .parent(&self.window)
+            .build(&mut self.language_menu)?;
+
+        {
+            let mut items = self.language_items.borrow_mut();
+
+            for language in Language::ALL {
+                let mut item = nwg::MenuItem::default();
+
+                nwg::MenuItem::builder()
+                    .text(language.native_name())
+                    .check(language == active_language)
+                    .parent(&self.language_menu)
+                    .build(&mut item)?;
+
+                items.push(item);
+            }
+        }
+
         // Draw the preset border manually so the group line stays soft and consistent.
         nwg::Frame::builder()
             .flags(nwg::FrameFlags::VISIBLE)
@@ -304,6 +341,10 @@ impl App {
             .size((PRESET_W, PRESET_H))
             .parent(&self.window)
             .build(&mut self.preset_panel)?;
+
+        // The preset title overlaps the frame border, so the frame must not paint
+        // over its siblings when it repaints (for example after a move).
+        clip_siblings(&self.preset_panel.handle);
 
         nwg::RichLabel::builder()
             .text("")
@@ -351,7 +392,7 @@ impl App {
             .build(&mut self.preset_line_bottom)?;
 
         nwg::RichLabel::builder()
-            .text("Fix rounded corners")
+            .text(t.preset_title)
             .position((TITLE_X, TITLE_Y))
             .size((TITLE_W, TITLE_H))
             .font(Some(&self.ui_font))
@@ -361,28 +402,28 @@ impl App {
             .build(&mut self.preset_title)?;
 
         nwg::Button::builder()
-            .text("Old workaround")
+            .text(t.old_workaround)
             .position((PRESET_BUTTON_X, OLD_BUTTON_Y))
             .size((PRESET_BUTTON_W, PRESET_BUTTON_H))
             .parent(&self.preset_panel)
             .build(&mut self.button_old)?;
 
         nwg::Button::builder()
-            .text("New workaround")
+            .text(t.new_workaround)
             .position((PRESET_BUTTON_X, NEW_BUTTON_Y))
             .size((PRESET_BUTTON_W, PRESET_BUTTON_H))
             .parent(&self.preset_panel)
             .build(&mut self.button_new)?;
 
         nwg::Button::builder()
-            .text("Restore default")
+            .text(t.restore_default)
             .position((PRESET_BUTTON_X, DEFAULT_BUTTON_Y))
             .size((PRESET_BUTTON_W, PRESET_BUTTON_H))
             .parent(&self.preset_panel)
             .build(&mut self.button_default)?;
 
         nwg::CheckBox::builder()
-            .text("Hide sign-in red dot")
+            .text(t.hide_sign_in)
             .position((CHECK_X, SIGN_IN_CHECK_Y))
             .size((CHECK_W, CHECK_H))
             .parent(&self.window)
@@ -391,14 +432,14 @@ impl App {
         self.check_sign_in_indicator.set_check_state(nwg::CheckBoxState::Checked);
 
         nwg::CheckBox::builder()
-            .text("Restore sidebar")
+            .text(t.restore_sidebar)
             .position((CHECK_X, SIDEBAR_CHECK_Y))
             .size((CHECK_W, CHECK_H))
             .parent(&self.window)
             .build(&mut self.check_restore_sidebar)?;
 
         nwg::CheckBox::builder()
-            .text("Disable extensions")
+            .text(t.disable_extensions)
             .position((CHECK_X, EXTENSIONS_CHECK_Y))
             .size((CHECK_W, CHECK_H))
             .parent(&self.window)
@@ -414,7 +455,7 @@ impl App {
             .parent(&self.window)
             .build(&mut self.status_box)?;
 
-        self.status_box.set_text("Ready");
+        self.status_box.set_text(t.status_ready);
         self.status_box.set_background_color(COLOR_CONTROL);
         self.status_box.set_readonly(true);
 
@@ -427,7 +468,7 @@ impl App {
             .build(&mut self.button_info)?;
 
         nwg::Button::builder()
-            .text("Exit")
+            .text(t.exit)
             .position((EXIT_X, ACTION_Y))
             .size((EXIT_W, ACTION_H))
             .parent(&self.window)
@@ -437,6 +478,8 @@ impl App {
     }
 
     fn build_shortcuts_window(&mut self) -> Result<(), nwg::NwgError> {
+        let t = self.strings();
+
         const WINDOW_W: i32 = 400;
 
         const MARGIN_X: i32 = 16;
@@ -497,7 +540,7 @@ impl App {
             .flags(nwg::WindowFlags::WINDOW)
             .size((WINDOW_W, WINDOW_H))
             .position((430, 330))
-            .title("Advanced")
+            .title(t.advanced_window_title)
             .build(&mut self.shortcuts_window)?;
 
         nwg::RichLabel::builder()
@@ -546,7 +589,7 @@ impl App {
             .build(&mut self.shortcut_target_line_bottom)?;
 
         nwg::RichLabel::builder()
-            .text("Shortcut targets")
+            .text(t.shortcut_targets_title)
             .position((SECTION_TITLE_X, TARGET_TITLE_Y))
             .size((TARGET_TITLE_W, SECTION_TITLE_H))
             .font(Some(&self.ui_font))
@@ -556,7 +599,7 @@ impl App {
             .build(&mut self.label_shortcuts_title)?;
 
         nwg::Label::builder()
-            .text("Choose which shortcut names are updated.")
+            .text(t.shortcut_targets_description)
             .position((SECTION_CONTENT_X, TARGET_DESCRIPTION_Y))
             .size((SECTION_CONTENT_W, DESCRIPTION_H))
             .parent(&self.shortcuts_window)
@@ -636,7 +679,7 @@ impl App {
             .build(&mut self.external_links_line_bottom)?;
 
         nwg::RichLabel::builder()
-            .text("External links")
+            .text(t.external_links_title)
             .position((SECTION_TITLE_X, EXTERNAL_TITLE_Y))
             .size((EXTERNAL_TITLE_W, SECTION_TITLE_H))
             .font(Some(&self.ui_font))
@@ -646,28 +689,28 @@ impl App {
             .build(&mut self.label_external_links_title)?;
 
         nwg::Label::builder()
-            .text("Use the same flags when Edge is opened by another app.\r\nSuch as Discord, Teams, Terminal.")
+            .text(t.external_links_description)
             .position((SECTION_CONTENT_X, EXTERNAL_DESCRIPTION_Y))
             .size((SECTION_CONTENT_W, EXTERNAL_DESCRIPTION_H))
             .parent(&self.shortcuts_window)
             .build(&mut self.label_external_links_description)?;
 
         nwg::CheckBox::builder()
-            .text("Apply to external links")
+            .text(t.apply_to_external_links)
             .position((CHECK_X, EXTERNAL_CHECK_Y))
             .size((CHECK_W, CHECK_H))
             .parent(&self.shortcuts_window)
             .build(&mut self.check_external_links)?;
 
         nwg::Button::builder()
-            .text("OK")
+            .text(t.ok)
             .position((BUTTON_OK_X, BUTTON_Y))
             .size((BUTTON_W, BUTTON_H))
             .parent(&self.shortcuts_window)
             .build(&mut self.button_shortcuts_ok)?;
 
         nwg::Button::builder()
-            .text("Cancel")
+            .text(t.cancel)
             .position((BUTTON_CANCEL_X, BUTTON_Y))
             .size((BUTTON_W, BUTTON_H))
             .parent(&self.shortcuts_window)
@@ -679,6 +722,8 @@ impl App {
     }
 
     fn build_custom_window(&mut self) -> Result<(), nwg::NwgError> {
+        let t = self.strings();
+
         const WINDOW_W: i32 = 470;
 
         const MARGIN_X: i32 = 16;
@@ -712,11 +757,11 @@ impl App {
             .flags(nwg::WindowFlags::WINDOW)
             .size((WINDOW_W, WINDOW_H))
             .position((430, 340))
-            .title("Custom")
+            .title(t.custom_window_title)
             .build(&mut self.custom_window)?;
 
         nwg::Label::builder()
-            .text("Standalone")
+            .text(t.standalone)
             .position((MARGIN_X, STANDALONE_LABEL_Y))
             .size((LABEL_W, LABEL_H))
             .parent(&self.custom_window)
@@ -729,7 +774,7 @@ impl App {
             .build(&mut self.text_standalone_flags)?;
 
         nwg::Label::builder()
-            .text("Enable features:")
+            .text(t.enable_features)
             .position((MARGIN_X, ENABLE_LABEL_Y))
             .size((LABEL_W, LABEL_H))
             .parent(&self.custom_window)
@@ -742,7 +787,7 @@ impl App {
             .build(&mut self.text_enable_features)?;
 
         nwg::Label::builder()
-            .text("Disable features:")
+            .text(t.disable_features)
             .position((MARGIN_X, DISABLE_LABEL_Y))
             .size((LABEL_W, LABEL_H))
             .parent(&self.custom_window)
@@ -755,14 +800,14 @@ impl App {
             .build(&mut self.text_disable_features)?;
 
         nwg::Button::builder()
-            .text("Apply")
+            .text(t.apply)
             .position((BUTTON_APPLY_X, BUTTON_Y))
             .size((BUTTON_W, BUTTON_H))
             .parent(&self.custom_window)
             .build(&mut self.button_apply_custom)?;
 
         nwg::Button::builder()
-            .text("Close")
+            .text(t.close)
             .position((BUTTON_CLOSE_X, BUTTON_Y))
             .size((BUTTON_W, BUTTON_H))
             .parent(&self.custom_window)
@@ -774,6 +819,8 @@ impl App {
     }
 
     fn build_help_window(&mut self) -> Result<(), nwg::NwgError> {
+        let t = self.strings();
+
         const WINDOW_W: i32 = 600;
 
         const MARGIN: i32 = 14;
@@ -784,7 +831,9 @@ impl App {
         const TEXT_X: i32 = MARGIN;
         const TEXT_Y: i32 = MARGIN;
         const TEXT_W: i32 = WINDOW_W - (MARGIN * 2);
-        const TEXT_H: i32 = 610;
+        // Taller than the English original so the translated help text fits
+        // without scrolling on every supported language.
+        const TEXT_H: i32 = 660;
         const BUTTON_X: i32 = TEXT_X + TEXT_W - BUTTON_W;
         const BUTTON_Y: i32 = TEXT_Y + TEXT_H + BUTTON_SECTION_GAP;
         const WINDOW_H: i32 = BUTTON_Y + BUTTON_H + BUTTON_SECTION_GAP;
@@ -793,22 +842,29 @@ impl App {
             .flags(nwg::WindowFlags::WINDOW)
             .size((WINDOW_W, WINDOW_H))
             .position((450, 280))
-            .title("Help")
+            .title(t.help_window_title)
             .build(&mut self.help_window)?;
 
+        // Translations are longer than the English original, so the help text
+        // scrolls instead of being silently cut off.
         nwg::RichTextBox::builder()
             .position((TEXT_X, TEXT_Y))
             .size((TEXT_W, TEXT_H))
             .font(Some(&self.ui_font))
             .readonly(false)
-            .flags(nwg::RichTextBoxFlags::VISIBLE | nwg::RichTextBoxFlags::SAVE_SELECTION)
+            .flags(
+                nwg::RichTextBoxFlags::VISIBLE
+                    | nwg::RichTextBoxFlags::SAVE_SELECTION
+                    | nwg::RichTextBoxFlags::VSCROLL
+                    | nwg::RichTextBoxFlags::AUTOVSCROLL
+            )
             .parent(&self.help_window)
             .build(&mut self.help_text)?;
 
         self.help_text.set_background_color(COLOR_WINDOW);
 
         nwg::Button::builder()
-            .text("OK")
+            .text(t.ok)
             .position((BUTTON_X, BUTTON_Y))
             .size((BUTTON_W, BUTTON_H))
             .parent(&self.help_window)
@@ -820,6 +876,8 @@ impl App {
     }
 
     fn build_status_window(&mut self) -> Result<(), nwg::NwgError> {
+        let t = self.strings();
+
         const WINDOW_W: i32 = 930;
 
         const MARGIN: i32 = 16;
@@ -854,12 +912,12 @@ impl App {
             .flags(nwg::WindowFlags::WINDOW)
             .size((WINDOW_W, WINDOW_H))
             .position((460, 290))
-            .title("Info")
+            .title(t.info_window_title)
             .build(&mut self.status_window)?;
 
         // Disabled RichLabel avoids cursor selection while keeping the simple header style.
         nwg::RichLabel::builder()
-            .text("EXECUTABLES")
+            .text(t.info_executables)
             .position((MARGIN, EDGE_HEADER_Y))
             .size((CONTENT_W, HEADER_H))
             .font(Some(&self.info_font))
@@ -881,7 +939,7 @@ impl App {
         self.status_edge_text.set_background_color(COLOR_WINDOW);
 
         nwg::RichLabel::builder()
-            .text("SHORTCUTS")
+            .text(t.info_shortcuts)
             .position((MARGIN, SHORTCUT_HEADER_Y))
             .size((CONTENT_W, HEADER_H))
             .font(Some(&self.info_font))
@@ -903,7 +961,7 @@ impl App {
         self.status_shortcut_text.set_background_color(COLOR_WINDOW);
 
         let selection = self.shortcut_selection.borrow();
-        let (edge_report, shortcut_report) = build_status_reports(&selection, None);
+        let (edge_report, shortcut_report) = build_status_reports(t, &selection, None);
         self.status_edge_text.set_text(&edge_report);
         self.status_shortcut_text.set_text(&shortcut_report);
         set_rich_text_box_format_rect(&self.status_edge_text, 10, 8, 10, 8);
@@ -912,7 +970,7 @@ impl App {
         self.status_shortcut_text.set_readonly(true);
 
         nwg::Button::builder()
-            .text("OK")
+            .text(t.ok)
             .position((BUTTON_X, BUTTON_Y))
             .size((BUTTON_W, BUTTON_H))
             .parent(&self.status_window)
@@ -924,46 +982,48 @@ impl App {
     }
 
     fn build_tooltips(&mut self) -> Result<(), nwg::NwgError> {
-        let standalone_text = "Example: --disable-extensions --force-dark-mode --mute-audio";
-        let enable_text = "Example: msForceNoRoundedCornerAndMargin,msUndersideButton,ParallelDownloading";
-        let disable_text = "Example: msShowSignInIndicator,msHubAppsSidebarRetirement,MediaRouter";
+        let t = self.strings();
+        let standalone_text = i18n::fill(t.tip_example, &["--disable-extensions --force-dark-mode --mute-audio"]);
+        let enable_text = i18n::fill(t.tip_example, &["msForceNoRoundedCornerAndMargin,msUndersideButton,ParallelDownloading"]);
+        let disable_text = i18n::fill(t.tip_example, &["msShowSignInIndicator,msHubAppsSidebarRetirement,MediaRouter"]);
+
+        let language_tooltip = i18n::fill(t.tip_language, &[(*self.language.borrow()).native_name()]);
 
         nwg::Tooltip::builder()
-            .register(&self.button_shortcuts, "Advanced")
-            .register(&self.button_custom, "Custom")
-            .register(&self.button_help, "Help")
-            .register(&self.button_info, "Info")
+            .register(&self.button_language, &language_tooltip)
+            .register(&self.button_shortcuts, t.tip_advanced)
+            .register(&self.button_custom, t.tip_custom)
+            .register(&self.button_help, t.tip_help)
+            .register(&self.button_info, t.tip_info)
             .register(&self.button_old, "--disable-features=msFeatureGroupNewLookAndFeelHoldout")
             .register(&self.button_new, "--enable-features=msForceNoRoundedCornerAndMargin")
-            .register(&self.button_default, "Restore normal Edge shortcut settings")
+            .register(&self.button_default, t.tip_restore_default)
             .register(&self.check_sign_in_indicator, "--disable-features=msShowSignInIndicator")
             .register(&self.check_restore_sidebar, "--disable-features=msHubAppsSidebarRetirement")
             .register(&self.check_disable_extensions, "--disable-extensions")
-            .register(&self.check_external_links, "Apply flags when Edge is opened by other apps")
+            .register(&self.check_external_links, t.tip_external_links)
             .register(&self.check_shortcut_stable, "Microsoft Edge.lnk")
             .register(&self.check_shortcut_beta, "Microsoft Edge Beta.lnk")
             .register(&self.check_shortcut_dev, "Microsoft Edge Dev.lnk")
             .register(&self.check_shortcut_canary, "Microsoft Edge Canary.lnk")
-            .register(&self.label_standalone_flags, standalone_text)
-            .register(&self.text_standalone_flags, standalone_text)
-            .register(&self.label_enable_features, enable_text)
-            .register(&self.text_enable_features, enable_text)
-            .register(&self.label_disable_features, disable_text)
-            .register(&self.text_disable_features, disable_text)
+            .register(&self.label_standalone_flags, &standalone_text)
+            .register(&self.text_standalone_flags, &standalone_text)
+            .register(&self.label_enable_features, &enable_text)
+            .register(&self.text_enable_features, &enable_text)
+            .register(&self.label_disable_features, &disable_text)
+            .register(&self.text_disable_features, &disable_text)
             .build(&mut self.tooltip)?;
 
         Ok(())
     }
 
-    fn load_settings(&self) {
-        let settings = shortcut::load_app_settings();
-
+    fn apply_settings(&self, settings: &shortcut::AppSettings) {
         self.check_sign_in_indicator.set_check_state(check_box_state(settings.hide_sign_in_indicator));
         self.check_restore_sidebar.set_check_state(check_box_state(settings.restore_sidebar));
         self.check_disable_extensions.set_check_state(check_box_state(settings.disable_extensions));
         self.check_external_links.set_check_state(check_box_state(settings.apply_external_links));
         self.set_shortcuts_checked(&settings.shortcut_selection);
-        *self.shortcut_selection.borrow_mut() = settings.shortcut_selection;
+        *self.shortcut_selection.borrow_mut() = settings.shortcut_selection.clone();
         *self.apply_external_links.borrow_mut() = settings.apply_external_links;
     }
 
@@ -973,7 +1033,8 @@ impl App {
             restore_sidebar: self.restore_sidebar_checked(),
             disable_extensions: self.disable_extensions_checked(),
             apply_external_links: self.apply_external_links_checked(),
-            shortcut_selection: self.shortcut_selection.borrow().clone()
+            shortcut_selection: self.shortcut_selection.borrow().clone(),
+            language: *self.language.borrow()
         };
 
         shortcut::save_app_settings(&settings);
@@ -998,6 +1059,8 @@ impl App {
             nwg::Event::OnButtonClick => {
                 if handle == self.button_exit.handle {
                     nwg::stop_thread_dispatch();
+                } else if handle == self.button_language.handle {
+                    self.show_language_menu();
                 } else if handle == self.button_shortcuts.handle {
                     self.show_shortcuts();
                 } else if handle == self.button_help.handle {
@@ -1011,7 +1074,7 @@ impl App {
                 } else if handle == self.button_new.handle {
                     self.apply_new_workaround();
                 } else if handle == self.button_default.handle {
-                    self.apply_options("", "Restore default");
+                    self.apply_options("", PresetName::RestoreDefault);
                 } else if handle == self.button_shortcuts_ok.handle {
                     self.save_shortcuts();
                 } else if handle == self.button_shortcuts_cancel.handle {
@@ -1024,6 +1087,14 @@ impl App {
                     self.close_help();
                 } else if handle == self.button_status_ok.handle {
                     self.close_status_info();
+                }
+            }
+
+            nwg::Event::OnMenuItemSelected => {
+                // Menu items are matched by handle, which keeps the mapping
+                // correct even if the language list is reordered later.
+                if let Some(language) = self.language_for_menu_item(&handle) {
+                    self.set_language(language);
                 }
             }
 
@@ -1116,12 +1187,12 @@ impl App {
 
     fn apply_old_workaround(&self) {
         let options = self.get_old_options();
-        self.apply_options(&options, "Old workaround");
+        self.apply_options(&options, PresetName::OldWorkaround);
     }
 
     fn apply_new_workaround(&self) {
         let options = self.get_new_options();
-        self.apply_options(&options, "New workaround");
+        self.apply_options(&options, PresetName::NewWorkaround);
     }
 
     fn apply_custom_flags(&self) {
@@ -1132,20 +1203,22 @@ impl App {
         let options = shortcut::get_custom_options_from_text(&standalone_text, &enable_text, &disable_text);
 
         if options.trim().is_empty() {
-            self.status_box.set_text("Enter custom flags");
+            *self.status_state.borrow_mut() = StatusState::EnterCustomFlags;
+            self.refresh_status_text();
             self.custom_window.set_focus();
             return;
         }
 
-        self.apply_options(&options, "Custom");
+        self.apply_options(&options, PresetName::Custom);
         self.custom_window.set_focus();
     }
 
-    fn apply_options(&self, options: &str, mode_name: &str) {
+    fn apply_options(&self, options: &str, preset: PresetName) {
         let selection = self.shortcut_selection.borrow().clone();
         let apply_external_links = self.apply_external_links_checked();
 
-        self.status_box.set_text("Applying...");
+        *self.status_state.borrow_mut() = StatusState::Applying;
+        self.refresh_status_text();
 
         let result = shortcut::apply_options(options, &selection, apply_external_links);
         let external_failed = result
@@ -1154,14 +1227,14 @@ impl App {
             .map(|external| matches!(&external.state, shortcut::ExternalLinkApplyState::Failed))
             .unwrap_or(false);
 
-        let status_message = if result.failed > 0 || external_failed {
-            "Completed with errors".to_string()
+        *self.status_state.borrow_mut() = if result.failed > 0 || external_failed {
+            StatusState::CompletedWithErrors
         } else {
-            format!("Applied: {}", mode_name)
+            StatusState::Applied(preset)
         };
 
-        self.status_box.set_text(&status_message);
         *self.last_apply_result.borrow_mut() = Some(result);
+        self.refresh_status_text();
         self.save_settings();
     }
 
@@ -1232,22 +1305,7 @@ impl App {
     }
 
     fn show_status_info(&self) {
-        let (edge_report, shortcut_report) = {
-            let selection = self.shortcut_selection.borrow();
-            let last_apply_result = self.last_apply_result.borrow();
-            build_status_reports(&selection, last_apply_result.as_ref())
-        };
-
-        // Temporarily unlock the boxes so their text can be refreshed.
-        self.status_edge_text.set_readonly(false);
-        self.status_edge_text.set_text(&edge_report);
-        self.status_edge_text.set_selection(0..0);
-        self.status_edge_text.set_readonly(true);
-
-        self.status_shortcut_text.set_readonly(false);
-        self.status_shortcut_text.set_text(&shortcut_report);
-        self.status_shortcut_text.set_selection(0..0);
-        self.status_shortcut_text.set_readonly(true);
+        self.refresh_status_reports();
 
         set_window_enabled(&self.window, false);
         center_window_on_cursor_monitor(&self.status_window);
@@ -1263,49 +1321,39 @@ impl App {
     }
 
     fn style_help_text(&self) {
-        // Apply formatting after the help text is loaded into RichEdit.
-        self.help_text.set_text(HELP_TEXT);
+        // The help text is rebuilt from the active translation table, and the
+        // headings are formatted from the byte ranges reported by the renderer
+        // instead of searching for words that may also appear in a body line.
+        let help = i18n::render_help(*self.language.borrow());
 
-        self.apply_help_format(0, HELP_TEXT.len(), nwg::CharEffects::empty(), BLACK);
+        self.help_text.set_text(&help.text);
+        self.apply_help_format(&help.text, 0, help.text.len(), nwg::CharEffects::empty(), BLACK);
 
-        for title in [
-            "Old workaround",
-            "New workaround",
-            "Restore default",
-            "Hide sign-in red dot",
-            "Restore sidebar",
-            "Disable extensions",
-            "Advanced",
-            "Custom",
-            "Info"
-        ] {
-            self.apply_all_help_text_format(title, nwg::CharEffects::BOLD, BLACK);
+        for title in &help.titles {
+            let color = if title.reminder { NOTE_RED } else { BLACK };
+
+            self.apply_help_format(&help.text, title.start, title.end, nwg::CharEffects::BOLD, color);
         }
 
-        self.apply_all_help_text_format("Reminder", nwg::CharEffects::BOLD, NOTE_RED);
+        const EDGE_SETTINGS_ADDRESS: &str = "edge://settings/system/manageSystem";
+        let mut search_start = 0usize;
 
-        self.apply_all_help_text_format("edge://settings/system/manageSystem", nwg::CharEffects::UNDERLINE, LINK_BLUE);
+        while let Some(offset) = help.text[search_start..].find(EDGE_SETTINGS_ADDRESS) {
+            let start = search_start + offset;
+            let end = start + EDGE_SETTINGS_ADDRESS.len();
+
+            self.apply_help_format(&help.text, start, end, nwg::CharEffects::UNDERLINE, LINK_BLUE);
+            search_start = end;
+        }
 
         set_rich_text_box_format_rect(&self.help_text, 4, 4, 4, 2);
         self.help_text.set_selection(0..0);
         self.help_text.set_readonly(true);
     }
 
-    fn apply_all_help_text_format(&self, needle: &str, effects: nwg::CharEffects, color: [u8; 3]) {
-        let mut search_start = 0usize;
-
-        while let Some(offset) = HELP_TEXT[search_start..].find(needle) {
-            let start = search_start + offset;
-            let end = start + needle.len();
-
-            self.apply_help_format(start, end, effects, color);
-            search_start = end;
-        }
-    }
-
-    fn apply_help_format(&self, start: usize, end: usize, effects: nwg::CharEffects, color: [u8; 3]) {
-        let selection_start = rich_edit_position(HELP_TEXT, start);
-        let selection_end = rich_edit_position(HELP_TEXT, end);
+    fn apply_help_format(&self, text: &str, start: usize, end: usize, effects: nwg::CharEffects, color: [u8; 3]) {
+        let selection_start = rich_edit_position(text, start);
+        let selection_end = rich_edit_position(text, end);
 
         self.help_text.set_selection(selection_start..selection_end);
 
@@ -1320,7 +1368,184 @@ impl App {
 
         self.help_text.set_char_format(&format);
     }
+    fn refresh_status_text(&self) {
+        self.status_box.set_text(&self.status_message());
+    }
 
+    fn status_message(&self) -> String {
+        let t = self.strings();
+
+        match *self.status_state.borrow() {
+            StatusState::Ready => t.status_ready.to_string(),
+            StatusState::Applying => t.status_applying.to_string(),
+            StatusState::CompletedWithErrors => t.status_completed_with_errors.to_string(),
+            StatusState::EnterCustomFlags => t.status_enter_custom_flags.to_string(),
+            StatusState::Applied(preset) => i18n::fill(t.status_applied, &[self.preset_label(preset)])
+        }
+    }
+
+    fn preset_label(&self, preset: PresetName) -> &'static str {
+        let t = self.strings();
+
+        match preset {
+            PresetName::OldWorkaround => t.old_workaround,
+            PresetName::NewWorkaround => t.new_workaround,
+            PresetName::RestoreDefault => t.restore_default,
+            PresetName::Custom => t.custom_window_title
+        }
+    }
+
+    fn refresh_status_reports(&self) {
+        let (edge_report, shortcut_report) = {
+            let selection = self.shortcut_selection.borrow();
+            let last_apply_result = self.last_apply_result.borrow();
+            build_status_reports(self.strings(), &selection, last_apply_result.as_ref())
+        };
+
+        // Temporarily unlock the boxes so their text can be refreshed.
+        self.status_edge_text.set_readonly(false);
+        self.status_edge_text.set_text(&edge_report);
+        self.status_edge_text.set_selection(0..0);
+        self.status_edge_text.set_readonly(true);
+
+        self.status_shortcut_text.set_readonly(false);
+        self.status_shortcut_text.set_text(&shortcut_report);
+        self.status_shortcut_text.set_selection(0..0);
+        self.status_shortcut_text.set_readonly(true);
+    }
+
+    fn language_for_menu_item(&self, handle: &nwg::ControlHandle) -> Option<Language> {
+        let items = self.language_items.borrow();
+
+        for (index, item) in items.iter().enumerate() {
+            if &item.handle == handle {
+                return Language::ALL.get(index).copied();
+            }
+        }
+
+        None
+    }
+
+    fn set_language(&self, language: Language) {
+        if *self.language.borrow() == language {
+            return;
+        }
+
+        *self.language.borrow_mut() = language;
+
+        for (index, item) in self.language_items.borrow().iter().enumerate() {
+            let checked = Language::ALL.get(index) == Some(&language);
+
+            item.set_checked(checked);
+        }
+
+        self.retranslate();
+        self.save_settings();
+    }
+
+    fn show_language_menu(&self) {
+        let Some(hwnd) = get_control_hwnd(&self.button_language.handle) else {
+            return;
+        };
+
+        let mut rect = RECT::default();
+
+        // SAFETY: hwnd belongs to the language button, and rect is a valid
+        // out-parameter that GetWindowRect fills synchronously.
+        if unsafe { GetWindowRect(hwnd, &mut rect) }.is_err() {
+            return;
+        }
+
+        // The menu opens under the button, right-aligned with it.
+        self.language_menu.popup_with_flags(
+            rect.left,
+            rect.bottom,
+            nwg::PopupMenuFlags::ALIGN_LEFT | nwg::PopupMenuFlags::ALIGN_TOP | nwg::PopupMenuFlags::LEFT_BUTTON
+        );
+    }
+
+    /// Re-applies every translated string to the existing controls. Runs once
+    /// during startup and again after each language change.
+    fn retranslate(&self) {
+        let language = *self.language.borrow();
+        let t = i18n::strings(language);
+
+        self.window.set_text(t.app_title);
+        self.shortcuts_window.set_text(t.advanced_window_title);
+        self.custom_window.set_text(t.custom_window_title);
+        self.help_window.set_text(t.help_window_title);
+        self.status_window.set_text(t.info_window_title);
+
+        self.button_language.set_text(language.short_label());
+
+        self.preset_title.set_text(t.preset_title);
+        self.button_old.set_text(t.old_workaround);
+        self.button_new.set_text(t.new_workaround);
+        self.button_default.set_text(t.restore_default);
+        self.check_sign_in_indicator.set_text(t.hide_sign_in);
+        self.check_restore_sidebar.set_text(t.restore_sidebar);
+        self.check_disable_extensions.set_text(t.disable_extensions);
+        self.button_exit.set_text(t.exit);
+
+        self.label_shortcuts_title.set_text(t.shortcut_targets_title);
+        self.label_shortcuts_description.set_text(t.shortcut_targets_description);
+        self.label_external_links_title.set_text(t.external_links_title);
+        self.label_external_links_description.set_text(t.external_links_description);
+        self.check_external_links.set_text(t.apply_to_external_links);
+        self.button_shortcuts_ok.set_text(t.ok);
+        self.button_shortcuts_cancel.set_text(t.cancel);
+
+        self.label_standalone_flags.set_text(t.standalone);
+        self.label_enable_features.set_text(t.enable_features);
+        self.label_disable_features.set_text(t.disable_features);
+        self.button_apply_custom.set_text(t.apply);
+        self.button_close_custom.set_text(t.close);
+
+        self.button_help_ok.set_text(t.ok);
+        self.button_status_ok.set_text(t.ok);
+        self.status_edge_header.set_text(t.info_executables);
+        self.status_shortcut_header.set_text(t.info_shortcuts);
+
+        self.apply_tooltips(t);
+        self.style_help_text();
+        self.layout_group_titles();
+        self.refresh_status_text();
+        self.refresh_status_reports();
+    }
+
+    fn apply_tooltips(&self, t: &Strings) {
+        self.tooltip.set_text(&self.button_shortcuts.handle, t.tip_advanced);
+        self.tooltip.set_text(&self.button_custom.handle, t.tip_custom);
+        self.tooltip.set_text(&self.button_help.handle, t.tip_help);
+        self.tooltip.set_text(&self.button_info.handle, t.tip_info);
+        self.tooltip.set_text(&self.button_default.handle, t.tip_restore_default);
+        self.tooltip.set_text(&self.check_external_links.handle, t.tip_external_links);
+
+        let language_name = (*self.language.borrow()).native_name();
+        let language_tooltip = i18n::fill(t.tip_language, &[language_name]);
+        self.tooltip.set_text(&self.button_language.handle, &language_tooltip);
+
+        let standalone_text = i18n::fill(t.tip_example, &["--disable-extensions --force-dark-mode --mute-audio"]);
+        let enable_text = i18n::fill(t.tip_example, &["msForceNoRoundedCornerAndMargin,msUndersideButton,ParallelDownloading"]);
+        let disable_text = i18n::fill(t.tip_example, &["msShowSignInIndicator,msHubAppsSidebarRetirement,MediaRouter"]);
+
+        self.tooltip.set_text(&self.label_standalone_flags.handle, &standalone_text);
+        self.tooltip.set_text(&self.text_standalone_flags.handle, &standalone_text);
+        self.tooltip.set_text(&self.label_enable_features.handle, &enable_text);
+        self.tooltip.set_text(&self.text_enable_features.handle, &enable_text);
+        self.tooltip.set_text(&self.label_disable_features.handle, &disable_text);
+        self.tooltip.set_text(&self.text_disable_features.handle, &disable_text);
+    }
+
+    fn layout_group_titles(&self) {
+        // Translated titles have different widths, so the border lines that run
+        // next to them are re-measured instead of using a fixed title width.
+        let t = self.strings();
+
+        layout_group_title(&self.ui_font, t.preset_title, &self.preset_title, &self.preset_line_top_right, MAIN_WINDOW_PRESET_RIGHT_X);
+        layout_group_title(&self.ui_font, t.shortcut_targets_title, &self.label_shortcuts_title, &self.shortcut_target_line_top_right, ADVANCED_SECTION_RIGHT_X);
+        layout_group_title(&self.ui_font, t.external_links_title, &self.label_external_links_title, &self.external_links_line_top_right, ADVANCED_SECTION_RIGHT_X);
+    }
     fn harden_window_chrome(&self) {
         harden_window_chrome(&self.window);
         harden_window_chrome(&self.shortcuts_window);
@@ -1342,6 +1567,68 @@ fn check_box_state(checked: bool) -> nwg::CheckBoxState {
     }
 }
 
+/// Space kept between a group title and the border line resuming on its right.
+const GROUP_TITLE_PADDING: i32 = 7;
+
+/// Right edge of the preset panel in the main window (312 - 14).
+const MAIN_WINDOW_PRESET_RIGHT_X: i32 = 298;
+
+/// Right edge of the section frames in the Advanced window (16 + 368).
+const ADVANCED_SECTION_RIGHT_X: i32 = 384;
+
+fn measure_text_width(font: &nwg::Font, text: &str) -> i32 {
+    if text.is_empty() {
+        return 0;
+    }
+
+    let wide: Vec<u16> = text.encode_utf16().collect();
+    let mut size = SIZE { cx: 0, cy: 0 };
+
+    // SAFETY: The screen device context is only used synchronously, the
+    // previously selected GDI object is restored, and the context is released
+    // before this function returns.
+    unsafe {
+        let dc = GetDC(None);
+
+        if dc.0.is_null() {
+            return approximate_text_width(&wide);
+        }
+
+        let previous = SelectObject(dc, HGDIOBJ(font.handle.cast()));
+        let measured = GetTextExtentPoint32W(dc, &wide, &mut size).as_bool();
+
+        SelectObject(dc, previous);
+        ReleaseDC(None, dc);
+
+        if measured {
+            size.cx
+        } else {
+            approximate_text_width(&wide)
+        }
+    }
+}
+
+fn approximate_text_width(wide: &[u16]) -> i32 {
+    // Keeps the layout usable if GDI cannot measure the text.
+    wide.len() as i32 * 7
+}
+
+fn layout_group_title(font: &nwg::Font, text: &str, label: &nwg::RichLabel, line: &nwg::RichLabel, right_x: i32) {
+    // A group title interrupts the group border, so the translated text decides
+    // where the border line on its right resumes.
+    let (label_x, label_y) = label.position();
+    let (_, label_height) = label.size();
+    let (_, line_y) = line.position();
+
+    let width = measure_text_width(font, text) + GROUP_TITLE_PADDING;
+    let line_x = label_x + width;
+    let line_width = (right_x - line_x).max(0);
+
+    label.set_position(label_x, label_y);
+    label.set_size(width as u32, label_height);
+    line.set_position(line_x, line_y);
+    line.set_size(line_width as u32, 1);
+}
 fn rich_edit_position(text: &str, byte_index: usize) -> u32 {
     // Convert Rust byte positions to RichEdit selection positions.
     let mut position = 0u32;
@@ -1367,14 +1654,14 @@ fn rich_edit_position(text: &str, byte_index: usize) -> u32 {
     position
 }
 
-fn build_status_reports(selection: &shortcut::ShortcutTargetSelection, last_apply_result: Option<&shortcut::ApplyResult>) -> (String, String) {
+fn build_status_reports(t: &Strings, selection: &shortcut::ShortcutTargetSelection, last_apply_result: Option<&shortcut::ApplyResult>) -> (String, String) {
     // Build each section separately so the Info window can size them independently.
     let mut edge_report = String::new();
     let candidates = shortcut::get_edge_executable_candidates();
-    write_edge_candidate_section(&mut edge_report, &candidates);
+    write_edge_candidate_section(t, &mut edge_report, &candidates);
 
     let mut shortcut_report = String::new();
-    write_shortcut_section(&mut shortcut_report, selection, last_apply_result);
+    write_shortcut_section(t, &mut shortcut_report, selection, last_apply_result);
 
     (
         edge_report.replace('\n', "\r\n"),
@@ -1382,9 +1669,9 @@ fn build_status_reports(selection: &shortcut::ShortcutTargetSelection, last_appl
     )
 }
 
-fn write_shortcut_section(report: &mut String, selection: &shortcut::ShortcutTargetSelection, last_apply_result: Option<&shortcut::ApplyResult>) {
+fn write_shortcut_section(t: &Strings, report: &mut String, selection: &shortcut::ShortcutTargetSelection, last_apply_result: Option<&shortcut::ApplyResult>) {
     if let Some(result) = last_apply_result {
-        write_selected_shortcuts(report, &result.selected_shortcut_names);
+        write_selected_shortcuts(t, report, &result.selected_shortcut_names);
 
         let updated = result
             .details
@@ -1404,20 +1691,25 @@ fn write_shortcut_section(report: &mut String, selection: &shortcut::ShortcutTar
             .filter(|detail| matches!(&detail.state, shortcut::ShortcutApplyState::IgnoredMissing))
             .collect::<Vec<_>>();
 
-        write_shortcut_group(report, "Updated", &updated);
-        write_shortcut_group(report, "Failed", &failed);
-        write_shortcut_group(report, "Missing", &missing);
+        write_shortcut_group(t, report, t.report_updated, &updated);
+        write_shortcut_group(t, report, t.report_failed, &failed);
+        write_shortcut_group(t, report, t.report_missing, &missing);
 
-        write_external_link_section(report);
+        write_external_link_section(t, report);
+
+        let found_count = result.found_shortcuts.to_string();
+        let updated_count = updated.len().to_string();
+        let missing_count = missing.len().to_string();
+        let failed_count = failed.len().to_string();
 
         let _ = writeln!(report);
         let _ = writeln!(
-            report, "Latest summary: {} found, {} updated, {} missing, {} failed",
-            result.found_shortcuts, updated.len(), missing.len(), failed.len()
+            report, "{}",
+            i18n::fill(t.report_latest_summary, &[&found_count, &updated_count, &missing_count, &failed_count])
         );
     } else {
         let selected_shortcuts = shortcut::selected_shortcut_display_names(selection);
-        write_selected_shortcuts(report, &selected_shortcuts);
+        write_selected_shortcuts(t, report, &selected_shortcuts);
 
         let mut found = Vec::new();
         let mut missing = Vec::new();
@@ -1431,41 +1723,41 @@ fn write_shortcut_section(report: &mut String, selection: &shortcut::ShortcutTar
         }
 
         if !found.is_empty() {
-            let _ = writeln!(report, "Found:");
+            let _ = writeln!(report, "{}", t.report_found);
 
             for path in found {
-                write_path_entry(report, shortcut_location_label(&path), &path);
+                write_path_entry(report, shortcut_location_label(t, &path), &path);
             }
 
             let _ = writeln!(report);
         }
 
         if !missing.is_empty() {
-            let _ = writeln!(report, "Missing:");
+            let _ = writeln!(report, "{}", t.report_missing);
 
             for path in missing {
-                write_path_entry(report, shortcut_location_label(&path), &path);
+                write_path_entry(report, shortcut_location_label(t, &path), &path);
             }
 
             let _ = writeln!(report);
         }
 
-        write_external_link_section(report);
+        write_external_link_section(t, report);
 
         let _ = writeln!(report);
-        let _ = writeln!(report, "No operation has run during this session.");
+        let _ = writeln!(report, "{}", t.report_no_operation);
     }
 }
 
-fn write_external_link_section(report: &mut String) {
-    let _ = writeln!(report, "Registry:");
-    let _ = writeln!(report, "  External links:");
+fn write_external_link_section(t: &Strings, report: &mut String) {
+    let _ = writeln!(report, "{}", t.report_registry);
+    let _ = writeln!(report, "  {}", t.report_external_links);
     let _ = writeln!(report, "    [{}]", shortcut::external_link_command_registry_key());
 
     if let Some(command) = shortcut::get_current_user_external_link_command() {
         write_external_link_command(report, &command);
     } else {
-        let _ = writeln!(report, "    None applied");
+        let _ = writeln!(report, "    {}", t.report_none_applied);
     }
 }
 
@@ -1497,52 +1789,52 @@ fn write_external_link_arguments(report: &mut String, arguments: &str) {
     }
 }
 
-fn write_selected_shortcuts(report: &mut String, names: &[&str]) {
+fn write_selected_shortcuts(t: &Strings, report: &mut String, names: &[&str]) {
     if names.is_empty() {
-        let _ = writeln!(report, "Selected: None");
+        let _ = writeln!(report, "{}", t.report_selected_none);
     } else {
-        let _ = writeln!(report, "Selected: {}", names.join(", "));
+        let _ = writeln!(report, "{}", i18n::fill(t.report_selected, &[&names.join(", ")]));
     }
 
     let _ = writeln!(report);
 }
 
-fn write_edge_candidate_section(report: &mut String, candidates: &[shortcut::EdgeExecutableCandidate]) {
+fn write_edge_candidate_section(t: &Strings, report: &mut String, candidates: &[shortcut::EdgeExecutableCandidate]) {
     let selected = candidates.iter().find(|candidate| candidate.selected);
 
-    let _ = writeln!(report, "Selected:");
+    let _ = writeln!(report, "{}", t.report_selected_header);
 
     if let Some(candidate) = selected {
-        write_candidate_entry(report, candidate, "");
+        write_candidate_entry(t, report, candidate, "");
     } else {
-        let _ = writeln!(report, "  Not found in common install locations");
+        let _ = writeln!(report, "  {}", t.report_not_found);
     }
 
     let _ = writeln!(report);
-    let _ = writeln!(report, "Candidates:");
+    let _ = writeln!(report, "{}", t.report_candidates);
 
     for candidate in candidates {
         let status = if candidate.exists {
-            "Exists"
+            t.report_exists
         } else if candidate.path.is_some() {
-            "Missing"
+            t.report_status_missing
         } else {
-            "Environment missing"
+            t.report_env_missing
         };
 
-        write_candidate_entry(report, candidate, status);
+        write_candidate_entry(t, report, candidate, status);
     }
 
     let _ = writeln!(report);
-    let _ = writeln!(report, "For reference and diagnostic purposes only.");
+    let _ = writeln!(report, "{}", t.report_reference_only);
 }
 
-fn write_candidate_entry(report: &mut String, candidate: &shortcut::EdgeExecutableCandidate, status: &str) {
+fn write_candidate_entry(t: &Strings, report: &mut String, candidate: &shortcut::EdgeExecutableCandidate, status: &str) {
     let path_text = candidate
         .path
         .as_ref()
         .map(|path| path.display().to_string())
-        .unwrap_or_else(|| "(environment variable not set)".to_string());
+        .unwrap_or_else(|| t.report_env_not_set.to_string());
 
     if status.is_empty() {
         let _ = writeln!(report, "  {}", candidate.source);
@@ -1552,15 +1844,15 @@ fn write_candidate_entry(report: &mut String, candidate: &shortcut::EdgeExecutab
     let _ = writeln!(report, "    {}", path_text);
 }
 
-fn write_shortcut_group(report: &mut String, title: &str, details: &[&shortcut::ShortcutApplyDetail]) {
+fn write_shortcut_group(t: &Strings, report: &mut String, title: &str, details: &[&shortcut::ShortcutApplyDetail]) {
     if details.is_empty() {
         return;
     }
 
-    let _ = writeln!(report, "{}:", title);
+    let _ = writeln!(report, "{}", title);
 
     for detail in details {
-        write_path_entry(report, shortcut_location_label(&detail.path), &detail.path);
+        write_path_entry(report, shortcut_location_label(t, &detail.path), &detail.path);
     }
 
     let _ = writeln!(report);
@@ -1571,32 +1863,32 @@ fn write_path_entry(report: &mut String, label: &str, path: &Path) {
     let _ = writeln!(report, "    {}", path.display());
 }
 
-fn shortcut_location_label(path: &Path) -> &'static str {
+fn shortcut_location_label(t: &Strings, path: &Path) -> &'static str {
     let value = path.to_string_lossy().to_ascii_lowercase();
 
     if value.contains(r"\programdata\microsoft\windows\start menu\") {
-        "System Start Menu"
+        t.location_system_start_menu
     } else if value.contains(r"\users\public\desktop\") || value.contains(r"\public\desktop\") {
-        "Public Desktop"
+        t.location_public_desktop
     } else if value.contains(r"\user pinned\taskbar\") {
-        "Pinned Taskbar"
+        t.location_pinned_taskbar
     } else if value.contains(r"\user pinned\startmenu\") {
-        "Pinned Start Menu"
+        t.location_pinned_start_menu
     } else if value.contains(r"\implicitappshortcuts\") {
-        "Implicit pinned shortcut"
+        t.location_implicit_pinned
     } else if value.contains(r"\internet explorer\quick launch\") {
-        "Quick Launch"
+        t.location_quick_launch
     } else if value.contains(r"\appdata\roaming\microsoft\windows\start menu\") {
-        "Current user Start Menu"
+        t.location_user_start_menu
     } else if value.contains(r"\desktop\") {
-        "Current user Desktop"
+        t.location_user_desktop
     } else {
-        "Shortcut"
+        t.location_generic
     }
 }
 
-fn show_plain_dialog(message: &str) {
-    let _ = nwg::simple_message(APP_TITLE, message);
+fn show_plain_dialog(title: &str, message: &str) {
+    let _ = nwg::simple_message(title, message);
 }
 
 fn get_hwnd(window: &nwg::Window) -> Option<HWND> {
@@ -1647,6 +1939,29 @@ fn set_window_enabled(window: &nwg::Window, enabled: bool) {
     // changes window state synchronously and does not retain pointers.
     unsafe {
         let _ = EnableWindow(hwnd, enabled);
+    }
+}
+
+fn clip_siblings(handle: &nwg::ControlHandle) {
+    // Keeps a container from drawing over the controls that overlap it.
+    let Some(hwnd) = get_control_hwnd(handle) else {
+        return;
+    };
+
+    // SAFETY: hwnd was obtained from a live NWG control. These calls only update
+    // the window style and repaint it synchronously.
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        let _ = SetWindowLongPtrW(hwnd, GWL_STYLE, style | WS_CLIPSIBLINGS.0 as isize);
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED
+        );
     }
 }
 
@@ -1848,15 +2163,19 @@ fn main() {
         return;
     }
 
+    // Startup failures happen before the interface exists, so they use the
+    // Windows display language instead of the stored preference.
+    let startup = i18n::strings(Language::detect_system());
+
     if let Err(error) = set_global_ui_font() {
-        show_plain_dialog(&format!("Failed to initialize Segoe UI font.\r\n\r\n{}", error));
+        show_plain_dialog(startup.app_title, &format!("{}\r\n\r\n{}", startup.error_font, error));
         return;
     }
 
     let _com = match shortcut::ComApartment::init() {
         Ok(com) => com,
         Err(error) => {
-            show_plain_dialog(&format!("Failed to initialize COM.\r\n\r\n{}", error));
+            show_plain_dialog(startup.app_title, &format!("{}\r\n\r\n{}", startup.error_com, error));
             return;
         }
     };
@@ -1864,7 +2183,7 @@ fn main() {
     let app = match App::build() {
         Ok(app) => Rc::new(app),
         Err(error) => {
-            show_plain_dialog(&format!("Failed to build the user interface.\r\n\r\n{}", error));
+            show_plain_dialog(startup.app_title, &format!("{}\r\n\r\n{}", startup.error_ui, error));
             return;
         }
     };

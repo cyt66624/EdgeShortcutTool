@@ -18,6 +18,8 @@ use windows::Win32::UI::Shell::{
     FOLDERID_Desktop, IShellLinkW, KF_FLAG_DEFAULT, SHGetKnownFolderPath, ShellLink
 };
 
+use crate::i18n::Language;
+
 const ARGUMENT_BUFFER_LEN: usize = 32_768;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const MANAGED_FEATURE_SWITCH_NAMES: [&str; 2] = ["--enable-features", "--disable-features"];
@@ -36,6 +38,7 @@ const SETTING_SHORTCUT_STABLE: &str = "ShortcutStable";
 const SETTING_SHORTCUT_BETA: &str = "ShortcutBeta";
 const SETTING_SHORTCUT_DEV: &str = "ShortcutDev";
 const SETTING_SHORTCUT_CANARY: &str = "ShortcutCanary";
+const SETTING_LANGUAGE: &str = "Language";
 
 #[derive(Clone, Copy)]
 pub struct ShortcutTarget {
@@ -133,7 +136,8 @@ pub struct AppSettings {
     pub restore_sidebar: bool,
     pub disable_extensions: bool,
     pub apply_external_links: bool,
-    pub shortcut_selection: ShortcutTargetSelection
+    pub shortcut_selection: ShortcutTargetSelection,
+    pub language: Language
 }
 
 impl Default for AppSettings {
@@ -143,7 +147,8 @@ impl Default for AppSettings {
             restore_sidebar: false,
             disable_extensions: false,
             apply_external_links: false,
-            shortcut_selection: ShortcutTargetSelection::default()
+            shortcut_selection: ShortcutTargetSelection::default(),
+            language: Language::English
         }
     }
 }
@@ -754,7 +759,11 @@ pub fn load_app_settings() -> AppSettings {
             beta: query_registry_bool(APP_REGISTRY_KEY, SETTING_SHORTCUT_BETA, false),
             dev: query_registry_bool(APP_REGISTRY_KEY, SETTING_SHORTCUT_DEV, false),
             canary: query_registry_bool(APP_REGISTRY_KEY, SETTING_SHORTCUT_CANARY, false)
-        }
+        },
+        // Fall back to the Windows display language on the very first start.
+        language: query_registry_named_value(APP_REGISTRY_KEY, SETTING_LANGUAGE)
+            .and_then(|value| Language::from_code(&value))
+            .unwrap_or_else(Language::detect_system)
     }
 }
 
@@ -767,6 +776,7 @@ pub fn save_app_settings(settings: &AppSettings) {
     let _ = set_registry_bool(APP_REGISTRY_KEY, SETTING_SHORTCUT_BETA, settings.shortcut_selection.beta);
     let _ = set_registry_bool(APP_REGISTRY_KEY, SETTING_SHORTCUT_DEV, settings.shortcut_selection.dev);
     let _ = set_registry_bool(APP_REGISTRY_KEY, SETTING_SHORTCUT_CANARY, settings.shortcut_selection.canary);
+    let _ = set_registry_named_value(APP_REGISTRY_KEY, SETTING_LANGUAGE, settings.language.code());
 }
 
 fn parse_registry_string_value(text: &str) -> Option<String> {

@@ -11,6 +11,7 @@ A small Windows utility for applying Microsoft Edge shortcut settings.
 * Custom feature flags
 * Choose which shortcut names are updated
 * Apply preset when Edge is opened by another app
+* Switch the interface language at runtime
 * Native Windows app
 
 ## Before using
@@ -34,9 +35,35 @@ Then fully close and restart Edge after applying changes.
 3. Keep **Hide sign-in red dot**, **Restore sidebar**, or **Disable extensions** checked if needed.
 4. Use **Advanced** to choose shortcut targets or enable support for links opened from other apps.
 5. Use **...** for Custom, **?** for Help, and **i** for Info.
-6. Restart Edge.
+6. Use the language button in the top-right corner to switch languages.
+7. Restart Edge.
 
 The tool remembers your selected options for the next time you open it.
+
+## Languages
+
+The button in the top-right corner of the main window opens a language menu. The
+interface is retranslated immediately, without restarting the tool, and the
+choice is stored next to the other settings.
+
+![Language menu](docs/language-menu.png)
+
+```text
+English
+简体中文   Chinese (Simplified)
+繁體中文   Chinese (Traditional)
+日本語     Japanese
+Deutsch    German
+Français   French
+Español    Spanish
+한국어     Korean
+```
+
+On the first start the tool follows the Windows display language and falls back
+to English for languages it does not provide.
+
+The translations live in `src/i18n.rs`. Adding a language means adding one entry
+to the `Language` enum and one `Strings` table.
 
 ## Presets
 
